@@ -30,7 +30,7 @@ import numpy as np
 import torch
 from torch import nn
 import torch.distributed as dist
-from PIL import ImageFilter, ImageOps
+from PIL import ImageFilter, ImageOps, Image
 
 
 class GaussianBlur(object):
@@ -827,3 +827,35 @@ def multi_scale(samples, model):
     v /= 3
     v /= v.norm()
     return v
+
+def vis_ms(img_ms, r, g, b):
+    """
+
+    :param img_ms: tensor images [B, C, H, W]
+    :param r: int
+    :param g: int
+    :param b: int
+    :return:
+    """
+    # extract rgb bands from multispectral image
+    img_ms_subspec = torch.cat(
+        (
+            img_ms[:, r].unsqueeze(1),
+            img_ms[:, g].unsqueeze(1),
+            img_ms[:, b].unsqueeze(1),
+        ),
+        dim=1,
+    )
+    return img_ms_subspec
+
+def save_tensor_img(tensor_img, img_path):
+    """
+    show tensor image
+    :param img: (tensor) [C, H, W]
+    :return:
+    """
+    npimg = tensor_img.detach().cpu().numpy()
+    npimg = np.transpose(npimg, (1, 2, 0))
+    npimg = (npimg * 255).astype(np.uint8)
+    pil_img = Image.fromarray(npimg)
+    pil_img.save(img_path)

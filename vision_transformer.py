@@ -20,6 +20,7 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from utils import trunc_normal_
 
@@ -289,3 +290,63 @@ class DINOHead(nn.Module):
         x = nn.functional.normalize(x, dim=-1, p=2)
         x = self.last_layer(x)
         return x
+
+class DINOST(nn.Module):
+    """
+    Perform spatio-temporal contrastive learning integrating the DINO technique.
+    """
+    def __init__(self, model):
+        super(DINOST, self).__init__()
+        self.model = model
+
+    def forward(self, x_pre, x_post):
+        # image latent representations
+        z_pre = self.model(x_pre)
+        z_post = self.model(x_post)
+
+        return z_pre, z_post
+    
+    def NT_Xent_Loss_v3(self, z_pre, z_post, tau=0.1):
+        """
+        Contrastive loss: InfoNCE loss
+        :param z_pre: (tensor) [batch, channels]
+        :param z_post: (tensor) [batch, channels]
+        :param tau: temperature
+        :return: InfoNCE loss
+        """
+        assert isinstance(z_pre, torch.Tensor)
+        assert isinstance(z_post, torch.Tensor)
+        assert z_pre.shape == z_post.shape
+
+        device = z_post.device
+        loss = torch.tensor(0.0, device=device)
+
+        # similarity between pairs of pre+post representations
+        n_samples, n_features = z_post.shape  # Batch size, Feature dimensions
+
+        # pairs similarity
+        for i in range(n_samples):
+            sim_positive = (F.cosine_similarity(z_pre[i], z_post[i], dim=0) / tau).exp()  # positive pairs similarity
+
+            curr_pre_batch = torch.cat([z_pre[[i]]] * (n_samples - 1), dim=0)
+            curr_post_batch = torch.cat([z_post[[i]]] * (n_samples - 1), dim=0)
+            others_pre_batch = torch.cat([z_pre[:i], z_pre[i + 1:]], dim=0)
+            others_post_batch = torch.cat([z_post[:i], z_post[i + 1:]], dim=0)
+
+            sim_negative = (F.cosine_similarity(curr_pre_batch, others_pre_batch, dim=1) / tau).exp().sum() \
+                           + (F.cosine_similarity(curr_pre_batch, others_post_batch, dim=1) / tau).exp().sum() \
+                           + (F.cosine_similarity(curr_post_batch, others_pre_batch, dim=1) / tau).exp().sum() \
+                           + (F.cosine_similarity(curr_post_batch, others_post_batch, dim=1) / tau).exp().sum() \
+                           + sim_positive
+
+            loss = loss - torch.log(sim_positive / sim_negative)
+        loss = loss / n_samples
+        return loss
+
+    def pairs_similarity(self, z_pre, z_post, metric = 'l2'):
+        if metric == 'cosine': # cosine similarity
+            return F.cosine_similarity(z_pre, z_post, dim=1)
+        else: # l2 norm of difference vector
+            z_pre = F.normalize(z_pre, p=2, dim=1)
+            z_post = F.normalize(z_post, p=2, dim=1)
+            return torch.linalg.norm(z_pre-z_post, dim=1)

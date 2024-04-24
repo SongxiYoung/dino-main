@@ -1,16 +1,3 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-# 
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-# 
-#     http://www.apache.org/licenses/LICENSE-2.0
-# 
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 import argparse
 import os
 import sys
@@ -19,6 +6,7 @@ import time
 import math
 import json
 from pathlib import Path
+from PIL import Image
 
 import numpy as np
 from PIL import Image
@@ -29,10 +17,13 @@ import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
 from torchvision import datasets, transforms
 from torchvision import models as torchvision_models
+from torchvision.utils import make_grid
 
 import utils
 import vision_transformer as vits
-from vision_transformer import DINOHead
+from vision_transformer import DINOHead, DINOST
+import dataproc_double as dp
+
 
 torchvision_archs = sorted(name for name in torchvision_models.__dict__
     if name.islower() and not name.startswith("__")
@@ -87,7 +78,7 @@ def get_args_parser():
     parser.add_argument('--clip_grad', type=float, default=3.0, help="""Maximal parameter
         gradient norm if using gradient clipping. Clipping with norm .3 ~ 1.0 can
         help optimization for larger ViT architectures. 0 for disabling.""")
-    parser.add_argument('--batch_size_per_gpu', default=64, type=int,
+    parser.add_argument('--batch_size_per_gpu', default=8, type=int,
         help='Per-GPU batch-size : number of distinct images loaded on one GPU.')
     parser.add_argument('--epochs', default=100, type=int, help='Number of epochs of training.')
     parser.add_argument('--freeze_last_layer', default=1, type=int, help="""Number of epochs
@@ -109,7 +100,7 @@ def get_args_parser():
         help="""Scale range of the cropped image before resizing, relatively to the origin image.
         Used for large global view cropping. When disabling multi-crop (--local_crops_number 0), we
         recommand using a wider range of scale ("--global_crops_scale 0.14 1." for example)""")
-    parser.add_argument('--local_crops_number', type=int, default=8, help="""Number of small
+    parser.add_argument('--local_crops_number', type=int, default=4, help="""Number of small
         local views to generate. Set this parameter to 0 to disable multi-crop training.
         When disabling multi-crop we recommend to use "--global_crops_scale 0.14 1." """)
     parser.add_argument('--local_crops_scale', type=float, nargs='+', default=(0.05, 0.4),
@@ -117,8 +108,9 @@ def get_args_parser():
         Used for small local view cropping of multi-crop.""")
 
     # Misc
-    parser.add_argument('--data_path', default='tiny-imagenet-200/train/', type=str,
-        help='Please specify path to the ImageNet training data.')
+    parser.add_argument('--data_path', default='/home/bpeng/mnt/mnt242/scdm_data/xBD/xbd_disasters_building_polygons_neighbors', type=str,
+        help='Please specify path to the training data.')
+    parser.add_argument('--csv_pretrain', type=str, default='csvs_buffer/sub_train_wo_unclassified.csv', help='train csv sub-path within data path')
     parser.add_argument('--output_dir', default=".", type=str, help='Path to save logs and checkpoints.')
     parser.add_argument('--saveckp_freq', default=20, type=int, help='Save checkpoint every x epochs.')
     parser.add_argument('--seed', default=0, type=int, help='Random seed.')
@@ -142,7 +134,9 @@ def train_dino(args):
         args.local_crops_scale,
         args.local_crops_number,
     )
-    dataset = datasets.ImageFolder(args.data_path, transform=transform)
+    dataset = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
+                                    csv_file=args.csv_pretrain,
+                                    transform=transform)
     sampler = torch.utils.data.DistributedSampler(dataset, shuffle=True)
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -153,6 +147,21 @@ def train_dino(args):
         drop_last=True,
     )
     print(f"Data loaded: there are {len(dataset)} images.")
+
+    # ============ Save the first batch of augmented images for inspection ============
+    # for i, batch in enumerate(data_loader):
+    #     bldg_pre = batch['bldg_pre']
+    #    bldg_post = batch['bldg_post']
+    #    for j, img in enumerate(bldg_pre):
+    #        grid = make_grid(utils.vis_ms(img, 0, 1, 2), nrow=8, normalize=True)
+    #        utils.save_tensor_img(grid, f'augmented_images/bldg_pre_batch_{i}_image_{j}.png')
+    #        print(f"bldg_pre_batch_{i}_image_{j}")
+    #    for j, img in enumerate(bldg_post):
+    #        grid = make_grid(utils.vis_ms(img, 0, 1, 2), nrow=8, normalize=True)
+    #        utils.save_tensor_img(grid, f'augmented_images/bldg_post_batch_{i}_image_{j}.png')
+    #        print(f"bldg_post_batch_{i}_image_{j}")
+    #    if i == 2:  # Save the first 2 batches
+    #        break
 
     # ============ building student and teacher networks ... ============
     # we changed the name DeiT-S for ViT-S to avoid confusions
@@ -190,6 +199,10 @@ def train_dino(args):
         teacher,
         DINOHead(embed_dim, args.out_dim, args.use_bn_in_head),
     )
+
+    student = DINOST(student)
+    teacher = DINOST(teacher)
+
     # move networks to gpu
     student, teacher = student.cuda(), teacher.cuda()
     # synchronize batch norms (if any)
@@ -220,6 +233,8 @@ def train_dino(args):
         args.warmup_teacher_temp_epochs,
         args.epochs,
     ).cuda()
+
+    ct_loss = float('inf')
 
     # ============ preparing optimizer ... ============
     params_groups = utils.get_params_groups(student)
@@ -265,12 +280,12 @@ def train_dino(args):
     start_epoch = to_restore["epoch"]
 
     start_time = time.time()
-    print("Starting DINO training !")
+    print("Starting DINOST training !")
     for epoch in range(start_epoch, args.epochs):
         data_loader.sampler.set_epoch(epoch)
 
         # ============ training one epoch of DINO ... ============
-        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss,
+        train_stats = train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, ct_loss,
             data_loader, optimizer, lr_schedule, wd_schedule, momentum_schedule,
             epoch, fp16_scaler, args)
 
@@ -298,12 +313,17 @@ def train_dino(args):
     print('Training time {}'.format(total_time_str))
 
 
-def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loader,
+def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, ct_loss, data_loader,
                     optimizer, lr_schedule, wd_schedule, momentum_schedule,epoch,
                     fp16_scaler, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Epoch: [{}/{}]'.format(epoch, args.epochs)
-    for it, (images, _) in enumerate(metric_logger.log_every(data_loader, 10, header)):
+    for it, batch in enumerate(metric_logger.log_every(data_loader, 10, header)):
+
+        bldg_pre = batch['bldg_pre']
+        bldg_post = batch['bldg_post']
+
+        # images, _ = batch
         # update weight decay and learning rate according to their schedule
         it = len(data_loader) * epoch + it  # global training iteration
         for i, param_group in enumerate(optimizer.param_groups):
@@ -312,12 +332,18 @@ def train_one_epoch(student, teacher, teacher_without_ddp, dino_loss, data_loade
                 param_group["weight_decay"] = wd_schedule[it]
 
         # move images to gpu
-        images = [im.cuda(non_blocking=True) for im in images]
+        bldg_pre = [im.cuda(non_blocking=True) for im in bldg_pre]
+        bldg_post = [im.cuda(non_blocking=True) for im in bldg_post]
+
+        # images = [im.cuda(non_blocking=True) for im in images]
         # teacher and student forward passes + compute dino loss
         with torch.cuda.amp.autocast(fp16_scaler is not None):
-            teacher_output = teacher(images[:2])  # only the 2 global views pass through the teacher
-            student_output = student(images)
-            loss = dino_loss(student_output, teacher_output, epoch)
+            t_pre, t_post = teacher(bldg_pre[:2], bldg_post[:2])  # only the 2 global views pass through the teacher
+            s_pre, s_post = student(bldg_pre, bldg_post)
+            s_loss = student.module.NT_Xent_Loss_v3(s_pre, s_post)
+            t_loss = teacher.NT_Xent_Loss_v3(t_pre, t_post)
+            loss = s_loss + t_loss
+            # loss = dino_loss(s_loss, t_loss, epoch)
 
         if not math.isfinite(loss.item()):
             print("Loss is {}, stopping training".format(loss.item()), force=True)
@@ -382,14 +408,15 @@ class DINOLoss(nn.Module):
         Cross-entropy between softmax outputs of the teacher and student networks.
         """
         student_out = student_output / self.student_temp
-        student_out = student_out.chunk(self.ncrops)
+        # student_out = student_out.chunk(self.ncrops)
 
         # teacher centering and sharpening
         temp = self.teacher_temp_schedule[epoch]
         teacher_out = F.softmax((teacher_output - self.center) / temp, dim=-1)
-        teacher_out = teacher_out.detach().chunk(2)
+        teacher_out = teacher_out.detach()
+        # teacher_out = teacher_out.detach().chunk(2)
 
-        total_loss = 0
+        """ total_loss = 0
         n_loss_terms = 0
         for iq, q in enumerate(teacher_out):
             for v in range(len(student_out)):
@@ -399,7 +426,8 @@ class DINOLoss(nn.Module):
                 loss = torch.sum(-q * F.log_softmax(student_out[v], dim=-1), dim=-1)
                 total_loss += loss.mean()
                 n_loss_terms += 1
-        total_loss /= n_loss_terms
+        total_loss /= n_loss_terms """
+        total_loss = torch.sum(-teacher_out * F.log_softmax(student_out, dim=-1))
         self.update_center(teacher_output)
         return total_loss
 
@@ -408,12 +436,20 @@ class DINOLoss(nn.Module):
         """
         Update center used for teacher output.
         """
-        batch_center = torch.sum(teacher_output, dim=0, keepdim=True)
-        dist.all_reduce(batch_center)
-        batch_center = batch_center / (len(teacher_output) * dist.get_world_size())
+        # Compute the new center value
+        batch_center = teacher_output.mean(dim=0)
 
-        # ema update
-        self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        # Check if teacher_output is a scalar
+        if teacher_output.dim() == 0:
+            # Handle the scalar case
+            self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum)
+        else:
+            # Handle the non-scalar case
+            batch_size = len(teacher_output) * dist.get_world_size()
+            self.center = self.center * self.center_momentum + batch_center * (1 - self.center_momentum) / batch_size
+
+        # Detach the center value to prevent gradients from being computed
+        self.center = self.center.detach()
 
 
 class DataAugmentationDINO(object):
@@ -455,13 +491,53 @@ class DataAugmentationDINO(object):
             normalize,
         ])
 
-    def __call__(self, image):
-        crops = []
-        crops.append(self.global_transfo1(image))
-        crops.append(self.global_transfo2(image))
+    def __call__(self, sample):
+        prepost_seed = []
         for _ in range(self.local_crops_number):
-            crops.append(self.local_transfo(image))
-        return crops
+            prepost_seed.append(torch.randint(low=0, high=int(1e6), size=(1,)).item())  
+            
+        for s in ['bldg_pre', 'bldg_post']:
+            crops = []
+            # Convert the numpy ndarray to a PIL Image for show up 
+            img = Image.fromarray(sample[s])
+            crops.append(self.global_transfo1(img))
+            crops.append(self.global_transfo2(img))
+            for _ in range(self.local_crops_number):
+                # restore state of the random number generator
+                torch.manual_seed(prepost_seed[_])
+                crops.append(self.local_transfo(img))
+                
+            sample[s] = crops
+
+        return sample
+
+    """ def __call__(self, image):
+        for s in ['bldg_pre', 'bldg_post']:
+            crops = []
+            crops.append(self.global_transfo1(image[s]))
+            crops.append(self.global_transfo2(image[s]))
+            for _ in range(self.local_crops_number):
+                crops.append(self.local_transfo(image[s]))
+            image[s] = crops
+
+        return image  """
+    
+    """ def __call__(self, sample):
+        for s in ['bldg_pre', 'bldg_post']:
+            crops = []
+            # Convert the numpy ndarray to a PIL Image for show up 
+            img = Image.fromarray(sample[s])
+            crops.append(self.global_transfo1(img))
+            crops.append(self.global_transfo2(img))
+            for _ in range(self.local_crops_number):
+                # Save the current state of the random number generator
+                state = torch.random.get_rng_state()
+                crops.append(self.local_transfo(img))
+                # Restore the state of the random number generator
+                torch.random.set_rng_state(state)
+            sample[s] = crops
+
+        return sample """
 
 
 if __name__ == '__main__':
