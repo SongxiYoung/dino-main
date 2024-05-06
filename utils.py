@@ -314,6 +314,7 @@ class MetricLogger(object):
     def __init__(self, delimiter="\t"):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
+        self.cm = None  # confusion matrix
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -321,6 +322,12 @@ class MetricLogger(object):
                 v = v.item()
             assert isinstance(v, (float, int))
             self.meters[k].update(v)
+    
+    def update_cm(self, cm):  # Add cm 
+        if self.cm is None:
+            self.cm = cm
+        else:
+            self.cm += cm
 
     def __getattr__(self, attr):
         if attr in self.meters:
@@ -336,6 +343,8 @@ class MetricLogger(object):
             loss_str.append(
                 "{}: {}".format(name, str(meter))
             )
+        if self.cm is not None:  # Add these lines
+            loss_str.append("cm: {}".format(str(self.cm)))
         return self.delimiter.join(loss_str)
 
     def synchronize_between_processes(self):

@@ -15,17 +15,21 @@ import os
 import argparse
 import json
 from pathlib import Path
+import numpy as np
 
 import torch
 from torch import nn
 import torch.distributed as dist
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from torchvision import datasets
 from torchvision import transforms as pth_transforms
 from torchvision import models as torchvision_models
+from sklearn.metrics import confusion_matrix, f1_score
 
 import utils
 import vision_transformer as vits
+import dataproc_double as dp
 
 
 def eval_linear(args):
@@ -57,18 +61,27 @@ def eval_linear(args):
     utils.load_pretrained_weights(model, args.pretrained_weights, args.checkpoint_key, args.arch, args.patch_size)
     print(f"Model {args.arch} built.")
 
-    linear_classifier = LinearClassifier(embed_dim, num_labels=args.num_labels)
+    # print(embed_dim)
+    linear_classifier = LinearClassifier(1, num_labels=args.num_labels)
     linear_classifier = linear_classifier.cuda()
     linear_classifier = nn.parallel.DistributedDataParallel(linear_classifier, device_ids=[args.gpu])
 
     # ============ preparing data ... ============
+    # same mean and std for pre and post images
+    mean_pre = (0.39327543, 0.40631564, 0.32678495)
+    std_pre = (0.16512179, 0.14379614, 0.15171282)
+    mean_post = (0.39327543, 0.40631564, 0.32678495)
+    std_post = (0.16512179, 0.14379614, 0.15171282)
+
     val_transform = pth_transforms.Compose([
-        pth_transforms.Resize(256, interpolation=3),
-        pth_transforms.CenterCrop(224),
-        pth_transforms.ToTensor(),
-        pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        dp.RandomResizedCrop(size=256, scale=(0.8, 1.0)),
+        dp.ToTensor(),
+        dp.Normalize_Std(mean_pre, std_pre, mean_post, std_post)
     ])
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, "val"), transform=val_transform)
+
+    dataset_val = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
+                                    csv_file=args.csv_valid,
+                                    transform=val_transform)
     val_loader = torch.utils.data.DataLoader(
         dataset_val,
         batch_size=args.batch_size_per_gpu,
@@ -83,13 +96,20 @@ def eval_linear(args):
         return
 
     train_transform = pth_transforms.Compose([
-        pth_transforms.RandomResizedCrop(224),
-        pth_transforms.RandomHorizontalFlip(),
-        pth_transforms.ToTensor(),
-        pth_transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
+        dp.RandomResizedCrop(size=224, scale=(0.8, 1.0)),
+        dp.RandomFlip(p=0.5),
+        dp.ToTensor(),
+        dp.Normalize_Std(mean_pre, std_pre, mean_post, std_post)
     ])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, "train"), transform=train_transform)
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset_train)
+
+    dataset_train = dp.xBD_Building_Polygon_TwoSides_PrePost(data_path = args.data_path,
+                                    csv_file=args.csv_train,
+                                    transform=train_transform)
+    sampler = torch.utils.data.DistributedSampler(dataset_train)
+
+    # data balance
+    # sampler = torch.utils.data.WeightedRandomSampler(dataset_train.class_weights, num_samples=len(4))
+
     train_loader = torch.utils.data.DataLoader(
         dataset_train,
         sampler=sampler,
@@ -123,7 +143,7 @@ def eval_linear(args):
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
 
-        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens)
+        train_stats = train(model, linear_classifier, optimizer, train_loader, epoch, args.n_last_blocks, args.avgpool_patchtokens, torch.from_numpy(dataset_train.class_weights))
         scheduler.step()
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
@@ -131,13 +151,13 @@ def eval_linear(args):
         if epoch % args.val_freq == 0 or epoch == args.epochs - 1:
             test_stats = validate_network(val_loader, model, linear_classifier, args.n_last_blocks, args.avgpool_patchtokens)
             print(f"Accuracy at epoch {epoch} of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}")
+            print(f"Confusion Matrix at epoch {epoch}: \n {test_stats['cm']}")
             best_acc = max(best_acc, test_stats["acc1"])
             print(f'Max accuracy so far: {best_acc:.2f}')
             log_stats = {**{k: v for k, v in log_stats.items()},
                          **{f'test_{k}': v for k, v in test_stats.items()}}
+            print(f"F1 score at epoch {epoch}: {test_stats['f1']:.3f}")
         if utils.is_main_process():
-            with (Path(args.output_dir) / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
             save_dict = {
                 "epoch": epoch + 1,
                 "state_dict": linear_classifier.state_dict(),
@@ -150,30 +170,55 @@ def eval_linear(args):
                 "Top-1 test accuracy: {acc:.1f}".format(acc=best_acc))
 
 
-def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool):
+def train(model, linear_classifier, optimizer, loader, epoch, n, avgpool, class_weights=None):
     linear_classifier.train()
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter('lr', utils.SmoothedValue(window_size=1, fmt='{value:.6f}'))
     header = 'Epoch: [{}]'.format(epoch)
-    for (inp, target) in metric_logger.log_every(loader, 20, header):
+    for it, batch in enumerate(metric_logger.log_every(loader, 20, header)):
+        bldg_pre = batch['bldg_pre']
+        bldg_post = batch['bldg_post']
+        bldg_label = batch['label']
+        batch_size = bldg_post.shape[0]
+        # print("Batch size: ", batch_size) # 128
+
         # move to gpu
-        inp = inp.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        bldg_pre = bldg_pre.float().cuda(non_blocking=True) 
+        bldg_post = bldg_post.float().cuda(non_blocking=True) 
+        bldg_label = bldg_label.cuda(non_blocking=True) 
+        class_weights = class_weights.float().cuda(non_blocking=True)
+
+        # inp = inp.cuda(non_blocking=True)       # input data
+        # target = target.cuda(non_blocking=True) # target label
 
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                intermediate_output_pre = model.get_intermediate_layers(bldg_pre, n)
+                output_pre = torch.cat([x[:, 0] for x in intermediate_output_pre], dim=-1)
+                intermediate_output_post = model.get_intermediate_layers(bldg_post, n)
+                output_post = torch.cat([x[:, 0] for x in intermediate_output_post], dim=-1)
                 if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
+                    output_pre = torch.cat((output_pre.unsqueeze(-1), torch.mean(intermediate_output_pre[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output_pre = output_pre.reshape(output_pre.shape[0], -1)
+                    output_post = torch.cat((output_post.unsqueeze(-1), torch.mean(intermediate_output_post[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output_post = output_post.reshape(output_post.shape[0], -1)
             else:
-                output = model(inp)
+                output_pre = model(bldg_pre)
+                output_post = model(bldg_post)
+        # Calculate cosine similarity
+        output_pre = F.normalize(output_pre, p=2, dim=1)
+        output_post = F.normalize(output_post, p=2, dim=1)  # [128, 1536]
+        # output = torch.linalg.norm(output_pre-output_post, dim=1) # [128, 1]
+
+        # Calculate cosine similarity
+        output = F.cosine_similarity(output_pre, output_post, dim=1)
+
+        # train the linear classifier
         output = linear_classifier(output)
 
         # compute cross entropy loss
-        loss = nn.CrossEntropyLoss()(output, target)
+        loss = nn.CrossEntropyLoss(weight=class_weights)(output, bldg_label)
 
         # compute the gradients
         optimizer.zero_grad()
@@ -197,32 +242,71 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
     linear_classifier.eval()
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
-    for inp, target in metric_logger.log_every(val_loader, 20, header):
+    cm = np.zeros((4, 4))
+    for it, batch in enumerate(metric_logger.log_every(val_loader, 20, header)):
+        bldg_pre = batch['bldg_pre']
+        bldg_post = batch['bldg_post']
+        bldg_label = batch['label']
+
         # move to gpu
-        inp = inp.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
+        bldg_pre = bldg_pre.float().cuda(non_blocking=True) 
+        bldg_post = bldg_post.float().cuda(non_blocking=True) 
+        bldg_label = bldg_label.cuda(non_blocking=True) 
+
+        # inp = inp.cuda(non_blocking=True)       # input data
+        # target = target.cuda(non_blocking=True) # target label
 
         # forward
         with torch.no_grad():
             if "vit" in args.arch:
-                intermediate_output = model.get_intermediate_layers(inp, n)
-                output = torch.cat([x[:, 0] for x in intermediate_output], dim=-1)
+                intermediate_output_pre = model.get_intermediate_layers(bldg_pre, n)
+                output_pre = torch.cat([x[:, 0] for x in intermediate_output_pre], dim=-1)
+                intermediate_output_post = model.get_intermediate_layers(bldg_post, n)
+                output_post = torch.cat([x[:, 0] for x in intermediate_output_post], dim=-1)
                 if avgpool:
-                    output = torch.cat((output.unsqueeze(-1), torch.mean(intermediate_output[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
-                    output = output.reshape(output.shape[0], -1)
+                    output_pre = torch.cat((output_pre.unsqueeze(-1), torch.mean(intermediate_output_pre[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output_pre = output_pre.reshape(output_pre.shape[0], -1)
+                    output_post = torch.cat((output_post.unsqueeze(-1), torch.mean(intermediate_output_post[-1][:, 1:], dim=1).unsqueeze(-1)), dim=-1)
+                    output_post = output_post.reshape(output_post.shape[0], -1)
             else:
-                output = model(inp)
+                output_pre = model(bldg_pre)
+                output_post = model(bldg_post)
+                
+        output_pre = F.normalize(output_pre, p=2, dim=1)
+        output_post = F.normalize(output_post, p=2, dim=1)
+        # Calculate l2 similarity
+        # output = torch.linalg.norm(output_pre-output_post, dim=1) # [128, 1]
+
+        # Calculate cosine similarity
+        output = F.cosine_similarity(output_pre, output_post, dim=1) # [128, 1]
+
         output = linear_classifier(output)
-        loss = nn.CrossEntropyLoss()(output, target)
+        loss = nn.CrossEntropyLoss()(output, bldg_label)
+
+        _, predicted = torch.max(output, 1)
+
+        # Convert tensors to CPU and to NumPy arrays
+        predicted_np = predicted.cpu().numpy()
+        labels_np = bldg_label.cpu().numpy()
+
+        # Calculate confusion matrix
+        current_cm = confusion_matrix(labels_np, predicted_np)
+        if cm is None:
+            cm = current_cm
+        else:
+            cm += current_cm
+        # Calculate F1 score
+        f1 = f1_score(labels_np, predicted_np, average='weighted')
 
         if linear_classifier.module.num_labels >= 5:
-            acc1, acc5 = utils.accuracy(output, target, topk=(1, 5))
+            acc1, acc5 = utils.accuracy(output, bldg_label, topk=(1, 5))
         else:
-            acc1, = utils.accuracy(output, target, topk=(1,))
+            acc1, = utils.accuracy(output, bldg_label, topk=(1,))
 
-        batch_size = inp.shape[0]
+        batch_size = bldg_pre.shape[0]
         metric_logger.update(loss=loss.item())
         metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+        
         if linear_classifier.module.num_labels >= 5:
             metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     if linear_classifier.module.num_labels >= 5:
@@ -231,7 +315,7 @@ def validate_network(val_loader, model, linear_classifier, n, avgpool):
     else:
         print('* Acc@1 {top1.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, losses=metric_logger.loss))
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {**{k: meter.global_avg for k, meter in metric_logger.meters.items()}, 'cm': cm, 'f1': f1}
 
 
 class LinearClassifier(nn.Module):
@@ -271,11 +355,16 @@ if __name__ == '__main__':
     parser.add_argument("--dist_url", default="env://", type=str, help="""url used to set up
         distributed training; see https://pytorch.org/docs/stable/distributed.html""")
     parser.add_argument("--local_rank", default=0, type=int, help="Please ignore and do not set this argument.")
-    parser.add_argument('--data_path', default='tiny-imagenet-200', type=str)
+    parser.add_argument('--data_path', type=str, default= "/home/bpeng/mnt/mnt242/scdm_data/xBD/xbd_disasters_building_polygons_neighbors")
+    parser.add_argument('--csv_train', type=str, default='csvs_buffer/sub_valid_wo_unclassified.csv', help='train csv sub-path within data path')
+    parser.add_argument('--csv_valid', type=str, default='csvs_buffer/sub_valid_wo_unclassified.csv', help='valid csv sub-path within data path')
+    # all data: train_tier3_test_hold_wo_unclassified
+    # train data: sub_train_wo_unclassified
+    # valid data: sub_valid_wo_unclassified
     parser.add_argument('--num_workers', default=10, type=int, help='Number of data loading workers per GPU.')
     parser.add_argument('--val_freq', default=1, type=int, help="Epoch frequency for validation.")
-    parser.add_argument('--output_dir', default=".", help='Path to save logs and checkpoints')
-    parser.add_argument('--num_labels', default=1000, type=int, help='Number of labels for linear classifier')
+    parser.add_argument('--output_dir', default="./linear", help='Path to save logs and checkpoints')
+    parser.add_argument('--num_labels', default=4, type=int, help='Number of labels for linear classifier')
     parser.add_argument('--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
     args = parser.parse_args()
     eval_linear(args)
